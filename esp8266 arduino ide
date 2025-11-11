@@ -1,0 +1,528 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ArduinoJson.h>
+
+// =======================
+// Wi-Fi credentials
+// =======================
+const char* ssid = "Galaxy S24 2499";
+const char* password = "12345678";
+
+// =======================
+// Pin definitions
+// =======================
+// Hand Gesture Control (5 LEDs)
+#define GESTURE_LED1 D1   // GPIO5 - Finger 1
+#define GESTURE_LED2 D2   // GPIO4 - Finger 2
+#define GESTURE_LED3 D3   // GPIO0 - Finger 3
+#define GESTURE_LED4 D4   // GPIO2 - Finger 4
+#define GESTURE_LED5 D6   // GPIO12 - Finger 5
+
+// Home Automation (reusing same pins when not in gesture mode)
+#define LED1 D1   // GPIO5 - Bedroom Light
+#define LED2 D2   // GPIO4 - Bedroom Fan
+#define LED3 D3   // GPIO0 - Garage Light
+#define LED4 D4   // GPIO2 - Garage Fan
+#define LED5 D7   // GPIO13 - Office Light
+#define LED6 D6   // GPIO12 - Office Fan
+#define BUZZER_PIN D5  // GPIO14
+
+#define UNIT 200 // Time unit for Morse code timing (ms)
+#define BRAILLE_DISPLAY_TIME 2000 // Time to display each braille character (ms)
+
+// =======================
+// Operating Mode
+// =======================
+enum OperationMode {
+  MODE_HOME_AUTOMATION,
+  MODE_GESTURE_CONTROL,
+  MODE_MORSE,
+  MODE_BRAILLE
+};
+
+OperationMode currentMode = MODE_HOME_AUTOMATION;
+
+// =======================
+// Home Automation State
+// =======================
+struct DeviceState {
+  bool bedroom_light;
+  bool bedroom_fan;
+  bool garage_light;
+  bool garage_fan;
+  bool office_light;
+  bool office_fan;
+};
+
+DeviceState currentState = {false, false, false, false, false, false};
+
+// =======================
+// Morse code lookup table
+// =======================
+const char* morseCodeTable[36] = {
+  ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---",
+  "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", "...", "-",
+  "..-", "...-", ".--", "-..-", "-.--", "--..",
+  "-----", ".----", "..---", "...--", "....-", ".....",
+  "-....", "--...", "---..", "----."
+};
+
+char letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+ESP8266WebServer server(80);
+
+// =======================
+// Function declarations
+// =======================
+void handleControl();
+void handleStatus();
+void handleGestureMode();
+void handleMorseEncode(JsonDocument& doc);
+void handleMorseDecode(JsonDocument& doc);
+void handleBrailleDisplay(JsonDocument& doc);
+void handleHomeControl(JsonDocument& doc);
+void transmitMorse(String text, bool useLED, bool useBuzzer);
+void transmitMorseCode(String morse, bool useLED, bool useBuzzer);
+void displayBraillePattern(int pattern[6]);
+void signal(int durationUnits, bool useLED, bool useBuzzer);
+const char* getMorseCode(char c);
+void turnOffAllLEDs();
+void setLEDState(String ledId, bool state);
+void applyDeviceStates();
+void processSerialCommand();
+
+// =======================
+// Setup
+// =======================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP8266 Unified Control System Starting...");
+
+  // Initialize all pins
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  pinMode(LED4, OUTPUT);
+  pinMode(LED5, OUTPUT);
+  pinMode(LED6, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Turn off all LEDs and buzzer
+  turnOffAllLEDs();
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // WiFi connect
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✓ WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Web server routes
+  server.on("/control", HTTP_POST, handleControl);
+  server.on("/gesture-mode", HTTP_POST, handleGestureMode);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.enableCORS(true);
+  server.begin();
+
+  Serial.println("✓ HTTP server started");
+  Serial.println("\n=== System Modes ===");
+  Serial.println("1. Home Automation (WiFi)");
+  Serial.println("2. Gesture Control (Serial)");
+  Serial.println("3. Morse Code (WiFi)");
+  Serial.println("4. Braille Display (WiFi)");
+  Serial.println("==================\n");
+  Serial.println("System Ready!");
+
+  // Test blink
+  for(int i = 0; i < 2; i++) {
+    digitalWrite(LED1, HIGH);
+    digitalWrite(LED2, HIGH);
+    digitalWrite(LED3, HIGH);
+    digitalWrite(LED4, HIGH);
+    digitalWrite(LED5, HIGH);
+    digitalWrite(LED6, HIGH);
+    delay(100);
+    turnOffAllLEDs();
+    delay(100);
+  }
+}
+
+// =======================
+// Loop
+// =======================
+void loop() {
+  server.handleClient();
+  
+  // Check for serial commands (gesture control)
+  if (Serial.available() > 0) {
+    processSerialCommand();
+  }
+}
+
+// =======================
+// Serial Command Processing (Gesture Control)
+// =======================
+void processSerialCommand() {
+  String data = Serial.readStringUntil('\n');
+  data.trim();
+  
+  if (data.length() > 0) {
+    // Check if it's a mode switch command
+    if (data.startsWith("MODE:")) {
+      String mode = data.substring(5);
+      if (mode == "GESTURE") {
+        currentMode = MODE_GESTURE_CONTROL;
+        Serial.println("Switched to GESTURE mode");
+      } else if (mode == "HOME") {
+        currentMode = MODE_HOME_AUTOMATION;
+        applyDeviceStates();
+        Serial.println("Switched to HOME AUTOMATION mode");
+      }
+      return;
+    }
+    
+    // Process gesture control commands (comma-separated LED states)
+    if (currentMode == MODE_GESTURE_CONTROL) {
+      int ledStates[5];
+      int startPos = 0;
+      
+      for (int i = 0; i < 5; i++) {
+        int commaPos = data.indexOf(',', startPos);
+        
+        if (commaPos == -1 && i == 4) {
+          ledStates[i] = data.substring(startPos).toInt();
+        } else if (commaPos != -1) {
+          ledStates[i] = data.substring(startPos, commaPos).toInt();
+          startPos = commaPos + 1;
+        } else {
+          ledStates[i] = 0;
+        }
+      }
+      
+      // Apply gesture LED states
+      digitalWrite(GESTURE_LED1, ledStates[0] ? HIGH : LOW);
+      digitalWrite(GESTURE_LED2, ledStates[1] ? HIGH : LOW);
+      digitalWrite(GESTURE_LED3, ledStates[2] ? HIGH : LOW);
+      digitalWrite(GESTURE_LED4, ledStates[3] ? HIGH : LOW);
+      digitalWrite(GESTURE_LED5, ledStates[4] ? HIGH : LOW);
+    }
+  }
+}
+
+// =======================
+// HTTP Handlers
+// =======================
+void handleGestureMode() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    StaticJsonDocument<256> doc;
+    deserializeJson(doc, body);
+    
+    bool enable = doc["enable"] | false;
+    
+    if (enable) {
+      currentMode = MODE_GESTURE_CONTROL;
+      Serial.println("MODE:GESTURE");
+    } else {
+      currentMode = MODE_HOME_AUTOMATION;
+      applyDeviceStates();
+      Serial.println("MODE:HOME");
+    }
+    
+    server.send(200, "application/json", "{\"success\":true}");
+  }
+}
+
+void handleControl() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    Serial.println("\n=== Received Command ===");
+    Serial.println(body);
+
+    StaticJsonDocument<2048> doc;
+    DeserializationError error = deserializeJson(doc, body);
+
+    if (error) {
+      Serial.println("ERROR: Invalid JSON");
+      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      return;
+    }
+
+    String path = server.uri();
+    String mode = doc["mode"].as<String>();
+
+    if (mode == "morse_encode") {
+      currentMode = MODE_MORSE;
+      handleMorseEncode(doc);
+    } else if (mode == "morse_decode") {
+      currentMode = MODE_MORSE;
+      handleMorseDecode(doc);
+    } else if (mode == "braille_display") {
+      currentMode = MODE_BRAILLE;
+      handleBrailleDisplay(doc);
+    } else if (mode == "home_control") {
+      currentMode = MODE_HOME_AUTOMATION;
+      handleHomeControl(doc);
+    } else {
+      Serial.println("ERROR: Unknown mode");
+      server.send(400, "application/json", "{\"error\":\"Unknown mode\"}");
+      return;
+    }
+
+    server.send(200, "application/json", "{\"success\":true}");
+  } else {
+    server.send(400, "application/json", "{\"error\":\"No data received\"}");
+  }
+}
+
+void handleStatus() {
+  StaticJsonDocument<512> doc;
+  doc["status"] = "online";
+  doc["ip"] = WiFi.localIP().toString();
+  doc["mode"] = currentMode == MODE_HOME_AUTOMATION ? "home" : 
+                currentMode == MODE_GESTURE_CONTROL ? "gesture" :
+                currentMode == MODE_MORSE ? "morse" : "braille";
+  
+  JsonObject states = doc.createNestedObject("devices");
+  states["bedroom_light"] = currentState.bedroom_light;
+  states["bedroom_fan"] = currentState.bedroom_fan;
+  states["garage_light"] = currentState.garage_light;
+  states["garage_fan"] = currentState.garage_fan;
+  states["office_light"] = currentState.office_light;
+  states["office_fan"] = currentState.office_fan;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+// =======================
+// Morse encode/decode logic
+// =======================
+void handleMorseEncode(JsonDocument& doc) {
+  String text = doc["text"].as<String>();
+  bool useLED = doc["led"] | true;
+  bool useBuzzer = doc["buzzer"] | true;
+
+  Serial.println("\n=== TEXT TO MORSE ===");
+  Serial.print("Text: ");
+  Serial.println(text);
+
+  transmitMorse(text, useLED, useBuzzer);
+  Serial.println("✓ Transmission Complete!\n");
+}
+
+void handleMorseDecode(JsonDocument& doc) {
+  String morse = doc["morse"].as<String>();
+  bool useLED = doc["led"] | false;
+  bool useBuzzer = doc["buzzer"] | false;
+
+  Serial.println("\n=== MORSE TO TEXT ===");
+  Serial.print("Morse: ");
+  Serial.println(morse);
+
+  if (useLED || useBuzzer) {
+    transmitMorseCode(morse, useLED, useBuzzer);
+  }
+  
+  Serial.println("✓ Complete!\n");
+}
+
+// =======================
+// Braille display logic
+// =======================
+void handleBrailleDisplay(JsonDocument& doc) {
+  String text = doc["text"].as<String>();
+  bool useLED = doc["led"] | true;
+  JsonArray patterns = doc["patterns"].as<JsonArray>();
+
+  Serial.println("\n=== BRAILLE DISPLAY ===");
+  Serial.print("Text: ");
+  Serial.println(text);
+
+  if (!useLED) return;
+
+  for (JsonVariant v : patterns) {
+    JsonObject charObj = v.as<JsonObject>();
+    JsonArray patternArray = charObj["pattern"].as<JsonArray>();
+    
+    int pattern[6];
+    for (int i = 0; i < 6; i++) {
+      pattern[i] = patternArray[i].as<int>();
+    }
+
+    displayBraillePattern(pattern);
+    delay(BRAILLE_DISPLAY_TIME);
+    turnOffAllLEDs();
+    delay(500);
+  }
+
+  applyDeviceStates();
+  Serial.println("✓ Braille Display Complete!\n");
+}
+
+// =======================
+// Home Automation Control
+// =======================
+void handleHomeControl(JsonDocument& doc) {
+  String description = doc["description"].as<String>();
+  JsonObject updates = doc["updates"].as<JsonObject>();
+  JsonObject states = doc["states"].as<JsonObject>();
+
+  Serial.println("\n=== HOME AUTOMATION CONTROL ===");
+  Serial.print("Description: ");
+  Serial.println(description);
+
+  if (states.containsKey("bedroom")) {
+    JsonObject bedroom = states["bedroom"].as<JsonObject>();
+    currentState.bedroom_light = bedroom["light"].as<bool>();
+    currentState.bedroom_fan = bedroom["fan"].as<bool>();
+  }
+  
+  if (states.containsKey("garage")) {
+    JsonObject garage = states["garage"].as<JsonObject>();
+    currentState.garage_light = garage["light"].as<bool>();
+    currentState.garage_fan = garage["fan"].as<bool>();
+  }
+  
+  if (states.containsKey("office")) {
+    JsonObject office = states["office"].as<JsonObject>();
+    currentState.office_light = office["light"].as<bool>();
+    currentState.office_fan = office["fan"].as<bool>();
+  }
+
+  for (JsonPair kv : updates) {
+    String ledId = kv.key().c_str();
+    bool state = kv.value().as<bool>();
+    setLEDState(ledId, state);
+  }
+
+  Serial.println("✓ Home Control Complete!\n");
+}
+
+// =======================
+// LED Control Functions
+// =======================
+void setLEDState(String ledId, bool state) {
+  if (ledId == "LED1") digitalWrite(LED1, state ? HIGH : LOW);
+  else if (ledId == "LED2") digitalWrite(LED2, state ? HIGH : LOW);
+  else if (ledId == "LED3") digitalWrite(LED3, state ? HIGH : LOW);
+  else if (ledId == "LED4") digitalWrite(LED4, state ? HIGH : LOW);
+  else if (ledId == "LED5") digitalWrite(LED5, state ? HIGH : LOW);
+  else if (ledId == "LED6") digitalWrite(LED6, state ? HIGH : LOW);
+}
+
+void applyDeviceStates() {
+  digitalWrite(LED1, currentState.bedroom_light ? HIGH : LOW);
+  digitalWrite(LED2, currentState.bedroom_fan ? HIGH : LOW);
+  digitalWrite(LED3, currentState.garage_light ? HIGH : LOW);
+  digitalWrite(LED4, currentState.garage_fan ? HIGH : LOW);
+  digitalWrite(LED5, currentState.office_light ? HIGH : LOW);
+  digitalWrite(LED6, currentState.office_fan ? HIGH : LOW);
+}
+
+// =======================
+// Morse Transmission
+// =======================
+void transmitMorse(String text, bool useLED, bool useBuzzer) {
+  text.toUpperCase();
+
+  for (int i = 0; i < text.length(); i++) {
+    char c = text[i];
+
+    if (c == ' ') {
+      delay(7 * UNIT);
+      continue;
+    }
+
+    const char* morse = getMorseCode(c);
+    if (morse != nullptr) {
+      for (int j = 0; morse[j] != '\0'; j++) {
+        if (morse[j] == '.') signal(1, useLED, useBuzzer);
+        else if (morse[j] == '-') signal(3, useLED, useBuzzer);
+        delay(UNIT);
+      }
+      delay(3 * UNIT);
+    }
+  }
+  
+  applyDeviceStates();
+}
+
+void transmitMorseCode(String morse, bool useLED, bool useBuzzer) {
+  for (int i = 0; i < morse.length(); i++) {
+    char c = morse[i];
+
+    if (c == '.') {
+      signal(1, useLED, useBuzzer);
+      delay(UNIT);
+    } else if (c == '-') {
+      signal(3, useLED, useBuzzer);
+      delay(UNIT);
+    } else if (c == ' ') {
+      delay(3 * UNIT);
+    } else if (c == '/') {
+      delay(7 * UNIT);
+    }
+  }
+  
+  applyDeviceStates();
+}
+
+// =======================
+// Braille LED control
+// =======================
+void displayBraillePattern(int pattern[6]) {
+  digitalWrite(LED1, pattern[0] ? HIGH : LOW);
+  digitalWrite(LED2, pattern[1] ? HIGH : LOW);
+  digitalWrite(LED3, pattern[2] ? HIGH : LOW);
+  digitalWrite(LED4, pattern[3] ? HIGH : LOW);
+  digitalWrite(LED5, pattern[4] ? HIGH : LOW);
+  digitalWrite(LED6, pattern[5] ? HIGH : LOW);
+}
+
+// =======================
+// Signal control
+// =======================
+void signal(int durationUnits, bool useLED, bool useBuzzer) {
+  if (useLED) {
+    digitalWrite(LED1, HIGH);
+    digitalWrite(LED2, HIGH);
+    digitalWrite(LED3, HIGH);
+    digitalWrite(LED4, HIGH);
+    digitalWrite(LED5, HIGH);
+    digitalWrite(LED6, HIGH);
+  }
+
+  if (useBuzzer) digitalWrite(BUZZER_PIN, HIGH);
+  delay(durationUnits * UNIT);
+
+  if (useLED) turnOffAllLEDs();
+  if (useBuzzer) digitalWrite(BUZZER_PIN, LOW);
+}
+
+// =======================
+// Helper functions
+// =======================
+void turnOffAllLEDs() {
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+  digitalWrite(LED4, LOW);
+  digitalWrite(LED5, LOW);
+  digitalWrite(LED6, LOW);
+}
+
+const char* getMorseCode(char c) {
+  for (int i = 0; i < 36; i++) {
+    if (letters[i] == c) return morseCodeTable[i];
+  }
+  return nullptr;
+}
